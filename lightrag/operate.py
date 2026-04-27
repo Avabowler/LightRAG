@@ -2548,31 +2548,95 @@ async def merge_nodes_and_edges(
             if pipeline_status.get("cancellation_requested", False):
                 raise PipelineCancelledException("User cancelled during merge phase")
 
-    # Collect all nodes and edges from all chunks
+    # =================================================================
+    # Phase 0: Collect — merge chunk-level extraction results into unified dicts
+    # =================================================================
+    #
+    # Input: chunk_results is a list of (maybe_nodes, maybe_edges) tuples,
+    #        one per text chunk processed by the LLM.
+    #
+    # Output:
+    #   all_nodes = { entity_name: [entity_data_dict, ...] }
+    #     - Keyed by entity name (exact string from LLM)
+    #     - Multiple entries if the same entity was extracted from multiple chunks
+    #
+    #   all_edges = { (src, tgt): [edge_data_dict, ...] }
+    #     - Keyed by sorted tuple (undirected graph: A->B == B->A)
+    #     - Multiple entries if the same relationship was extracted from multiple chunks
+    #
     all_nodes = defaultdict(list)
     all_edges = defaultdict(list)
+    rename_map = {}  # old_name -> existing_name
+    # 整理所有的nodes和edges
+    # Entity types allowed for merging (lowercase, no spaces as stored)
+    _mergeable_entity_types = {"checkstep", "codeaction", "faultsymptom"}
 
     for i, (maybe_nodes, maybe_edges) in enumerate(chunk_results, start=1):
-        # Collect nodes
         for entity_name, entities in maybe_nodes.items():
-            all_nodes[entity_name].extend(entities)
+            resolved_name = entity_name  # 默认不改变
 
-        # Collect edges with sorted keys for undirected graph
+            # Check if this entity type is allowed for merging
+            entity_type = entities[0].get("entity_type", "") if entities else ""
+            can_merge = entity_type in _mergeable_entity_types
+
+            if can_merge and entity_name not in rename_map:
+                # 还没查过这个实体，去 VDB 查一下
+                try:
+                    query_result = await entity_vdb.query(
+                        f"{entity_name}\n{entities[0].get('description', '')}",
+                        top_k=1,
+                    )
+                    if query_result:
+                        best = query_result[0]  # 取第一条（最相似的）
+                        distance = best.get("distance", 0.0)
+                        matched_name = best.get("entity_name", entity_name)
+
+                        # 注意：distance 的含义取决于向量库实现
+                        # cosine similarity: 越大越相似，阈值 > 0.8
+                        # 如果匹配到的是自己，跳过
+                        if matched_name != entity_name and distance > 0.8:
+                            rename_map[entity_name] = matched_name
+                            resolved_name = matched_name
+                            logger.info(
+                                f"Entity resolution: '{entity_name}' -> '{matched_name}' "
+                                f"(distance: {distance:.4f})"
+                            )
+                except Exception as e:
+                    logger.warning(f"VDB query failed for '{entity_name}': {e}")
+            elif can_merge and entity_name in rename_map:
+                # 已经查过了，直接用缓存结果
+                resolved_name = rename_map[entity_name]
+
+            all_nodes[resolved_name].extend(entities)
+        logger.info(f"rename_map: {rename_map}")
+        logger.info(f"maybe_edges: {maybe_edges}")
+        # Edge keys are sorted so (A,B) and (B,A) map to the same entry
         for edge_key, edges in maybe_edges.items():
-            sorted_edge_key = tuple(sorted(edge_key))
+            src, tgt = edge_key
+            # 应用实体消解的映射
+            new_src = rename_map.get(src, src)
+            new_tgt = rename_map.get(tgt, tgt)
+            # 跳过自环边（消解后 src == tgt）
+            if new_src == new_tgt:
+                logger.info(
+                    f"Skipping self-loop after resolution: '{src}'-'{tgt}'"
+                )
+                continue
+            sorted_edge_key = tuple(sorted([new_src, new_tgt]))
             all_edges[sorted_edge_key].extend(edges)
+        logger.info(f"all_edges: {all_edges}")
         await _cooperative_yield(i, every=32)
 
     total_entities_count = len(all_nodes)
-    total_relations_count = len(all_edges)
-
+    total_relations_count = len(all_edges)  
+    
     log_message = f"Merging stage {current_file_number}/{total_files}: {file_path}"
     logger.info(log_message)
     async with pipeline_status_lock:
         pipeline_status["latest_message"] = log_message
         pipeline_status["history_messages"].append(log_message)
 
-    # Get max async tasks limit from global_config for semaphore control
+    # Concurrency limiter: controls how many entities/edges are processed in parallel
     graph_max_async = global_config.get("llm_model_max_async", 4) * 2
     semaphore = asyncio.Semaphore(graph_max_async)
 
@@ -2584,8 +2648,9 @@ async def merge_nodes_and_edges(
         pipeline_status["history_messages"].append(log_message)
 
     async def _locked_process_entity_name(entity_name, entities):
-        async with semaphore:
-            # Check for cancellation before processing entity
+        """Process a single entity with concurrency control and keyed lock."""
+        async with semaphore:  # Limit concurrency
+            # Cancellation check
             if pipeline_status is not None and pipeline_status_lock is not None:
                 async with pipeline_status_lock:
                     if pipeline_status.get("cancellation_requested", False):
@@ -2593,6 +2658,7 @@ async def merge_nodes_and_edges(
                             "User cancelled during entity merge"
                         )
 
+            # Acquire per-entity lock to prevent concurrent writes to the same node
             workspace = global_config.get("workspace", "")
             namespace = f"{workspace}:GraphDB" if workspace else "GraphDB"
             async with get_storage_keyed_lock(
@@ -2618,7 +2684,7 @@ async def merge_nodes_and_edges(
                     error_msg = f"Error processing entity `{entity_name}`: {e}"
                     logger.error(error_msg)
 
-                    # Try to update pipeline status, but don't let status update failure affect main exception
+                    # Update pipeline status (best-effort, don't mask original error)
                     try:
                         if (
                             pipeline_status is not None
@@ -2632,20 +2698,20 @@ async def merge_nodes_and_edges(
                             f"Failed to update pipeline status: {status_error}"
                         )
 
-                    # Re-raise the original exception with a prefix
+                    # Re-raise with entity name prefix for debugging
                     prefixed_exception = create_prefixed_exception(
                         e, f"`{entity_name}`"
                     )
                     raise prefixed_exception from e
 
-    # Create entity processing tasks
+    # Launch all entity tasks concurrently
     entity_tasks = []
     for i, (entity_name, entities) in enumerate(all_nodes.items(), start=1):
         task = asyncio.create_task(_locked_process_entity_name(entity_name, entities))
         entity_tasks.append(task)
         await _cooperative_yield(i, every=16)
 
-    # Execute entity tasks with error handling
+    # Wait for all entity tasks; stop on first exception
     processed_entities = []
     if entity_tasks:
         done, pending = await asyncio.wait(
@@ -2655,6 +2721,7 @@ async def merge_nodes_and_edges(
         first_exception = None
         processed_entities = []
 
+        # Collect results from completed tasks
         for i, task in enumerate(done, start=1):
             try:
                 result = task.result()
@@ -2665,6 +2732,7 @@ async def merge_nodes_and_edges(
                 processed_entities.append(result)
             await _cooperative_yield(i, every=32)
 
+        # Cancel and collect any still-pending tasks
         if pending:
             for task in pending:
                 task.cancel()
@@ -2679,9 +2747,22 @@ async def merge_nodes_and_edges(
         if first_exception is not None:
             raise first_exception
 
-        await asyncio.sleep(0)
+        await asyncio.sleep(0)  # Yield to event loop
 
-    # ===== Phase 2: Process all relationships concurrently =====
+    # =================================================================
+    # Phase 2: Process all relationships — merge into graph + relationships_vdb
+    # =================================================================
+    #
+    # For each edge in all_edges:
+    #   1. Acquire a per-edge lock (keyed by sorted [src, tgt])
+    #   2. Call _merge_edges_then_upsert():
+    #      - If edge already exists: merge description, weight, keywords, etc.
+    #      - If edge is new: create it in graph + insert into relationships_vdb
+    #      - If either endpoint node doesn't exist yet: create placeholder nodes
+    #      - Returns merged edge data + list of newly created placeholder entities
+    #
+    # All edges are processed concurrently (bounded by semaphore).
+    #
     log_message = f"Phase 2: Processing {total_relations_count} relations from {doc_id} (async: {graph_max_async})"
     logger.info(log_message)
     async with pipeline_status_lock:
@@ -2689,8 +2770,9 @@ async def merge_nodes_and_edges(
         pipeline_status["history_messages"].append(log_message)
 
     async def _locked_process_edges(edge_key, edges):
+        """Process a single relationship with concurrency control and keyed lock."""
         async with semaphore:
-            # Check for cancellation before processing edges
+            # Cancellation check
             if pipeline_status is not None and pipeline_status_lock is not None:
                 async with pipeline_status_lock:
                     if pipeline_status.get("cancellation_requested", False):
@@ -2698,6 +2780,7 @@ async def merge_nodes_and_edges(
                             "User cancelled during relation merge"
                         )
 
+            # Acquire per-edge lock (sorted key ensures A->B and B->A use same lock)
             workspace = global_config.get("workspace", "")
             namespace = f"{workspace}:GraphDB" if workspace else "GraphDB"
             sorted_edge_key = sorted([edge_key[0], edge_key[1]])
@@ -2708,7 +2791,9 @@ async def merge_nodes_and_edges(
                 enable_logging=False,
             ):
                 try:
-                    added_entities = []  # Track entities added during edge processing
+                    # added_entities collects placeholder nodes created when
+                    # an edge references an entity that wasn't in Phase 1
+                    added_entities = []
 
                     logger.debug(f"Processing relation {sorted_edge_key}")
                     edge_data = await _merge_edges_then_upsert(
@@ -2722,9 +2807,9 @@ async def merge_nodes_and_edges(
                         pipeline_status,
                         pipeline_status_lock,
                         llm_response_cache,
-                        added_entities,  # Pass list to collect added entities
+                        added_entities,
                         relation_chunks_storage,
-                        entity_chunks_storage,  # Add entity_chunks_storage parameter
+                        entity_chunks_storage,
                     )
 
                     if edge_data is None:
@@ -2736,7 +2821,6 @@ async def merge_nodes_and_edges(
                     error_msg = f"Error processing relation `{sorted_edge_key}`: {e}"
                     logger.error(error_msg)
 
-                    # Try to update pipeline status, but don't let status update failure affect main exception
                     try:
                         if (
                             pipeline_status is not None
@@ -2750,22 +2834,21 @@ async def merge_nodes_and_edges(
                             f"Failed to update pipeline status: {status_error}"
                         )
 
-                    # Re-raise the original exception with a prefix
                     prefixed_exception = create_prefixed_exception(
                         e, f"{sorted_edge_key}"
                     )
                     raise prefixed_exception from e
 
-    # Create relationship processing tasks
+    # Launch all edge tasks concurrently
     edge_tasks = []
     for i, (edge_key, edges) in enumerate(all_edges.items(), start=1):
         task = asyncio.create_task(_locked_process_edges(edge_key, edges))
         edge_tasks.append(task)
         await _cooperative_yield(i, every=16)
 
-    # Execute relationship tasks with error handling
+    # Wait for all edge tasks; stop on first exception
     processed_edges = []
-    all_added_entities = []
+    all_added_entities = []  # Placeholder entities created during edge processing
 
     if edge_tasks:
         done, pending = await asyncio.wait(
@@ -2805,19 +2888,25 @@ async def merge_nodes_and_edges(
 
         await asyncio.sleep(0)
 
-    # ===== Phase 3: Update full_entities and full_relations storage =====
+    # =================================================================
+    # Phase 3: Update per-document entity/relation index
+    # =================================================================
+    #
+    # Store the final set of entity names and relation pairs for this
+    # document in full_entities_storage and full_relations_storage.
+    # This enables later queries like "which documents mention entity X?"
+    #
     if full_entities_storage and full_relations_storage and doc_id:
         try:
-            # Merge all entities: original entities + entities added during edge processing
             final_entity_names = set()
 
-            # Add original processed entities
+            # Phase 1 entities
             for i, entity_data in enumerate(processed_entities, start=1):
                 if entity_data and entity_data.get("entity_name"):
                     final_entity_names.add(entity_data["entity_name"])
                 await _cooperative_yield(i, every=32)
 
-            # Add entities that were added during relationship processing
+            # Phase 2 placeholder entities (created when edges referenced missing nodes)
             for i, added_entity in enumerate(all_added_entities, start=1):
                 if added_entity and added_entity.get("entity_name"):
                     final_entity_names.add(added_entity["entity_name"])
@@ -2840,7 +2929,7 @@ async def merge_nodes_and_edges(
                 pipeline_status["latest_message"] = log_message
                 pipeline_status["history_messages"].append(log_message)
 
-            # Update storage
+            # Persist entity name list for this document
             if final_entity_names:
                 await full_entities_storage.upsert(
                     {
@@ -2851,6 +2940,7 @@ async def merge_nodes_and_edges(
                     }
                 )
 
+            # Persist relation pair list for this document
             if final_relation_pairs:
                 await full_relations_storage.upsert(
                     {
@@ -2868,11 +2958,12 @@ async def merge_nodes_and_edges(
             )
 
         except Exception as e:
+            # Phase 3 failure is non-fatal: the graph is already updated
             logger.error(
                 f"Failed to update entity-relation index for document {doc_id}: {e}"
             )
-            # Don't raise exception to avoid affecting main flow
 
+    # Final summary log
     log_message = f"Completed merging: {len(processed_entities)} entities, {len(all_added_entities)} extra entities, {len(processed_edges)} relations"
     logger.info(log_message)
     async with pipeline_status_lock:
@@ -2905,6 +2996,12 @@ async def extract_entities(
     entity_types = global_config["addon_params"].get(
         "entity_types", DEFAULT_ENTITY_TYPES
     )
+    entity_types = [
+        "FaultSymptom","FaultCategory","RootCause","CheckStep","CodeAction","Conclusion"
+    ]
+    relationship_types = [
+        "BELONGS_TO", "HAS_ROOT_CAUSE", "REQUIRES_STEP", "USES_CODE", "LEADS_TO", "NEXT_STEP"
+    ]
 
     examples = "\n".join(PROMPTS["entity_extraction_examples"])
 
@@ -2921,6 +3018,7 @@ async def extract_entities(
         tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
         completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
         entity_types=",".join(entity_types),
+        relationship_types=", ".join(relationship_types),
         examples=examples,
         language=language,
     )

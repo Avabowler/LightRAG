@@ -440,6 +440,9 @@ def parse_args() -> argparse.Namespace:
     args.cosine_threshold = get_env_value(
         "COSINE_THRESHOLD", DEFAULT_COSINE_THRESHOLD, float
     )
+    args.entity_disambig_threshold = get_env_value(
+        "ENTITY_DISAMBIG_THRESHOLD", 0.85, float
+    )
     args.related_chunk_number = get_env_value(
         "RELATED_CHUNK_NUMBER", DEFAULT_RELATED_CHUNK_NUMBER, int
     )

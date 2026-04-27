@@ -1089,6 +1089,7 @@ def create_app(args):
                 "language": args.summary_language,
                 "entity_types": args.entity_types,
             },
+            entity_disambig_threshold=args.entity_disambig_threshold,
             ollama_server_infos=ollama_server_infos,
         )
     except Exception as e:
@@ -1290,6 +1291,7 @@ def create_app(args):
                     "force_llm_summary_on_merge": args.force_llm_summary_on_merge,
                     "max_parallel_insert": args.max_parallel_insert,
                     "cosine_threshold": args.cosine_threshold,
+                    "entity_disambig_threshold": args.entity_disambig_threshold,
                     "min_rerank_score": args.min_rerank_score,
                     "related_chunk_number": args.related_chunk_number,
                     "max_async": args.max_async,

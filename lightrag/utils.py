@@ -511,7 +511,7 @@ class EmbeddingFunc:
 
         # Call the actual embedding function
         result = await self.func(*args, **kwargs)
-
+        logger.info(f"Embedding function {self.func.__name__} returned result with shape {result.shape}")
         # Validate embedding dimensions using total element count
         total_elements = result.size  # Total number of elements in the numpy array
         expected_dim = self.embedding_dim

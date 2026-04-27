@@ -523,6 +523,22 @@ class LightRAG:
         default=float(os.getenv("COSINE_THRESHOLD", 0.2))
     )
 
+    entity_disambig_threshold: float = field(
+        default=float(os.getenv("ENTITY_DISAMBIG_THRESHOLD", 0.85))
+    )
+    """Cosine similarity threshold for entity disambiguation during merge.
+    When an exact name match fails, entity_vdb is queried for similar entities.
+    If similarity >= this threshold, the entities are merged.
+    Set to 1.0 to disable disambiguation. Default: 0.85."""
+
+    entity_dedup_threshold: float = field(
+        default=float(os.getenv("ENTITY_DEDUP_THRESHOLD", 0.90))
+    )
+    """Cosine similarity threshold for batch-internal entity deduplication.
+    Within a single merge batch, entity names with embedding similarity >= this
+    threshold are merged into one canonical entity (e.g. "Pod" and "Kubernetes Pod").
+    Set to 1.0 to disable batch deduplication. Default: 0.90."""
+
     ollama_server_infos: Optional[OllamaServerInfos] = field(default=None)
     """Configuration for Ollama server information."""
 

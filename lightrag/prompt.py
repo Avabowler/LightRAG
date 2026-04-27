@@ -16,6 +16,7 @@ You are a Knowledge Graph Specialist responsible for extracting entities and rel
     *   **Identification:** Identify clearly defined and meaningful entities in the input text.
     *   **Entity Details:** For each identified entity, extract the following information:
         *   `entity_name`: The name of the entity. If the entity name is case-insensitive, capitalize the first letter of each significant word (title case). Ensure **consistent naming** across the entire extraction process.
+            - For a **FaultSymptom** (e.g., a pod crash, node not ready, image pull error): Use the format `[resource_type]_[failure_description]_[event_description]`. Example: `Pod_CrashLoopBackOff_[xxx]`, `Node_NotReady_[xxx]`, `Pod_ImagePullBackOff_[xxx]`, `Service_NoEndpoints_[xxx]`.
         *   `entity_type`: Categorize the entity using one of the following types: `{entity_types}`. If none of the provided entity types apply, do not add new entity type and classify it as `Other`.
         *   `entity_description`: Provide a concise yet comprehensive description of the entity's attributes and activities, based *solely* on the information present in the input text.
     *   **Output Format - Entities:** Output a total of 4 fields for each entity, delimited by `{tuple_delimiter}`, on a single line. The first field *must* be the literal string `entity`.
@@ -23,12 +24,23 @@ You are a Knowledge Graph Specialist responsible for extracting entities and rel
 
 2.  **Relationship Extraction & Output:**
     *   **Identification:** Identify direct, clearly stated, and meaningful relationships between previously extracted entities.
+    *   **Allowed Relationship Schema (Strict Whitelist):**  
+        You MUST ONLY extract relationships that exactly match one of the following six binary schemas. Any relationship not conforming to these `(source_type → target_type)` constraints is considered invalid and MUST be discarded. Do NOT invent new relationship types, and do NOT output `Other`.
+
+        | Relationship Type | Source Entity Type | Target Entity Type | Semantic Meaning |
+        |---|---|---|---|
+        | `BELONGS_TO` | `FaultSymptom` | `FaultCategory` | 现象属于某故障类别导致 |
+        | `HAS_ROOT_CAUSE` | `FaultCategory` | `RootCause` | 类别包含可能的根因 |
+        | `REQUIRES_STEP` | `RootCause` | `CheckStep` | 排查该原因需要的步骤 |
+        | `USES_CODE` | `CheckStep` | `CodeAction` | 步骤对应的代码或命令 |
+        | `LEADS_TO` | `CheckStep` | `Conclusion` | 步骤得出的结论 |
+        | `NEXT_STEP` | `CheckStep` | `CheckStep` | 步骤间的前后执行顺序 |
     *   **N-ary Relationship Decomposition:** If a single statement describes a relationship involving more than two entities (an N-ary relationship), decompose it into multiple binary (two-entity) relationship pairs for separate description.
         *   **Example:** For "Alice, Bob, and Carol collaborated on Project X," extract binary relationships such as "Alice collaborated with Project X," "Bob collaborated with Project X," and "Carol collaborated with Project X," or "Alice collaborated with Bob," based on the most reasonable binary interpretations.
     *   **Relationship Details:** For each binary relationship, extract the following fields:
         *   `source_entity`: The name of the source entity. Ensure **consistent naming** with entity extraction. Capitalize the first letter of each significant word (title case) if the name is case-insensitive.
         *   `target_entity`: The name of the target entity. Ensure **consistent naming** with entity extraction. Capitalize the first letter of each significant word (title case) if the name is case-insensitive.
-        *   `relationship_keywords`: One or more high-level keywords summarizing the overarching nature, concepts, or themes of the relationship. Multiple keywords within this field must be separated by a comma `,`. **DO NOT use `{tuple_delimiter}` for separating multiple keywords within this field.**
+        *   `relationship_keywords`: Categorize the relationship using one of the following types: `{relationship_types}`. If none of the provided entity types apply, do not add new entity type and classify it as `Other`. One or more high-level keywords summarizing the overarching nature, concepts, or themes of the relationship. Multiple keywords within this field must be separated by a comma `,`. **DO NOT use `{tuple_delimiter}` for separating multiple keywords within this field.**
         *   `relationship_description`: A concise explanation of the nature of the relationship between the source and target entities, providing a clear rationale for their connection.
     *   **Output Format - Relationships:** Output a total of 5 fields for each relationship, delimited by `{tuple_delimiter}`, on a single line. The first field *must* be the literal string `relation`.
         *   Format: `relation{tuple_delimiter}source_entity{tuple_delimiter}target_entity{tuple_delimiter}relationship_keywords{tuple_delimiter}relationship_description`
@@ -101,84 +113,41 @@ Based on the last extraction task, identify and extract any **missed or incorrec
 
 PROMPTS["entity_extraction_examples"] = [
     """<Entity_types>
-["Person","Creature","Organization","Location","Event","Concept","Method","Content","Data","Artifact","NaturalObject"]
+["FaultSymptom","FaultCategory","RootCause","CheckStep","CodeAction","Conclusion"]
 
 <Input Text>
 ```
-while Alex clenched his jaw, the buzz of frustration dull against the backdrop of Taylor's authoritarian certainty. It was this competitive undercurrent that kept him alert, the sense that his and Jordan's shared commitment to discovery was an unspoken rebellion against Cruz's narrowing vision of control and order.
-
-Then Taylor did something unexpected. They paused beside Jordan and, for a moment, observed the device with something akin to reverence. "If this tech can be understood..." Taylor said, their voice quieter, "It could change the game for us. For all of us."
-
-The underlying dismissal earlier seemed to falter, replaced by a glimpse of reluctant respect for the gravity of what lay in their hands. Jordan looked up, and for a fleeting heartbeat, their eyes locked with Taylor's, a wordless clash of wills softening into an uneasy truce.
-
-It was a small transformation, barely perceptible, but one that Alex noted with an inward nod. They had all been brought here by different paths
+故障现象：Pod 处于 ContainerCreating 状态, Event reason 提示挂卷失败报错all targetPortals not available。
+排查方法：1. 获取故障 Pod 信息和事件\n\n**目标：** 获取故障 Pod 的信息以及事件。\n\n**操作：** 获取 Pod 的 JSON 数据，同时获取与该 Pod 相关的事件。\n\n**需要执行的命令：**\n```bash\nkubectl get pod <pod_name> -n <namespace> -o json\nkubectl get events --field-selector=involvedObject.name=<pod_name> -n <namespace> --sort-by='.lastTimestamp' -o json\n```\n\n---\n\n2. 获取Pod对应的数据节点信息\n\n**目标：** 获取故障Pod所在的数据节点信息和node_ip。\n\n**操作：** 从上一个步骤中的Pod json得到nodename。并执行`kubectl get node <nodename> -ojson`，读取其中的node_ip\n\n**需要执行的命令：**无\n\n3. 在数据节点上获取磁阵的ip地址\n\n**目标：** 获取节点上磁阵的ip session。\n\n**操作：** 从上一个步骤中获取数据节点的ip，在数据节点上执行`iscsiadm -m session`，从结果中解析得到对应的session ip。返回结果的格式如下tcp: [1] <ip>:<port>,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx**需要执行的命令：**```bash\niscsiadm -m session\n```\n\n4. 检查数据节点上的网络连通性\n\n**目标：**检查数据节点到磁阵的session ip是否连通。**操作：** 遍历上一步骤中的到的ip地址，执行ping来验证网络连通性。如果执行结果包含'100% packet loss'，说明是网络问题导致的卷挂载失败。**需要执行的命令：**```bash\nping -c 3 <ip>\n```
 ```
 
 <Output>
-entity{tuple_delimiter}Alex{tuple_delimiter}person{tuple_delimiter}Alex is a character who experiences frustration and is observant of the dynamics among other characters.
-entity{tuple_delimiter}Taylor{tuple_delimiter}person{tuple_delimiter}Taylor is portrayed with authoritarian certainty and shows a moment of reverence towards a device, indicating a change in perspective.
-entity{tuple_delimiter}Jordan{tuple_delimiter}person{tuple_delimiter}Jordan shares a commitment to discovery and has a significant interaction with Taylor regarding a device.
-entity{tuple_delimiter}Cruz{tuple_delimiter}person{tuple_delimiter}Cruz is associated with a vision of control and order, influencing the dynamics among other characters.
-entity{tuple_delimiter}The Device{tuple_delimiter}equipment{tuple_delimiter}The Device is central to the story, with potential game-changing implications, and is revered by Taylor.
-relation{tuple_delimiter}Alex{tuple_delimiter}Taylor{tuple_delimiter}power dynamics, observation{tuple_delimiter}Alex observes Taylor's authoritarian behavior and notes changes in Taylor's attitude toward the device.
-relation{tuple_delimiter}Alex{tuple_delimiter}Jordan{tuple_delimiter}shared goals, rebellion{tuple_delimiter}Alex and Jordan share a commitment to discovery, which contrasts with Cruz's vision.)
-relation{tuple_delimiter}Taylor{tuple_delimiter}Jordan{tuple_delimiter}conflict resolution, mutual respect{tuple_delimiter}Taylor and Jordan interact directly regarding the device, leading to a moment of mutual respect and an uneasy truce.
-relation{tuple_delimiter}Jordan{tuple_delimiter}Cruz{tuple_delimiter}ideological conflict, rebellion{tuple_delimiter}Jordan's commitment to discovery is in rebellion against Cruz's vision of control and order.
-relation{tuple_delimiter}Taylor{tuple_delimiter}The Device{tuple_delimiter}reverence, technological significance{tuple_delimiter}Taylor shows reverence towards the device, indicating its importance and potential impact.
+entity{tuple_delimiter}Pod_ContainerCreating_[all targetPortals not available]{tuple_delimiter}FaultSymptom{tuple_delimiter}Pod 处于 ContainerCreating 状态, Event reason 提示挂卷失败报错all targetPortals not available。
+entity{tuple_delimiter}数据节点与后端存储ip网络不通{tuple_delimiter}RootCause{tuple_delimiter}因为节点与网络不通，卷挂载失败，并最终导致的Pod处于ContainerCreating阶段
+entity{tuple_delimiter}网络故障导致的Pod ContainerCreating故障{tuple_delimiter}FaultCategory{tuple_delimiter}因为网络不通，导致Pod 处于ContainerCreating，无法正常启动。
+entity{tuple_delimiter}获取Pod对应的数据节点信息{tuple_delimiter}CheckStep{tuple_delimiter}获取故障Pod所在的数据节点信息和node_ip，从上一步Pod JSON中提取nodename并查询节点详情
+entity{tuple_delimiter}在数据节点上获取磁阵的ip地址{tuple_delimiter}CheckStep{tuple_delimiter}获取节点上磁阵的ip session，在数据节点上执行iscsiadm命令解析session ip
+entity{tuple_delimiter}检查数据节点上的网络连通性{tuple_delimiter}CheckStep{tuple_delimiter}检查数据节点到磁阵的session ip是否连通，使用ping验证网络连通性，判断是否丢包
+entity{tuple_delimiter}kubectl get pod{tuple_delimiter}CodeAction{tuple_delimiter}kubectl get pod <pod_name> -n <namespace> -o json
+entity{tuple_delimiter}kubectl get events{tuple_delimiter}CodeAction{tuple_delimiter}kubectl get events --field-selector=involvedObject.name=<pod_name> -n <namespace> --sort-by='.lastTimestamp' -o json
+entity{tuple_delimiter}iscsiadm session{tuple_delimiter}CodeAction{tuple_delimiter}iscsiadm -m session
+entity{tuple_delimiter}ping storage ip{tuple_delimiter}CodeAction{tuple_delimiter}ping -c 3 <ip>
+entity{tuple_delimiter}网络不通导致卷挂载失败{tuple_delimiter}Conclusion{tuple_delimiter}执行结果包含'100% packet loss'，确认是网络问题导致的卷挂载失败，all targetPortals not available根因确认
+relation{tuple_delimiter}Pod Fault: all targetPortals not available{tuple_delimiter}Pod ContainerCreating故障{tuple_delimiter}BELONGS_TO{tuple_delimiter}Pod挂卷失败现象属于ContainerCreating故障分类
+relation{tuple_delimiter}Pod ContainerCreating故障{tuple_delimiter}网络不通{tuple_delimiter}HAS_ROOT_CAUSE{tuple_delimiter}ContainerCreating故障可能由网络不通导致存储无法挂载引起
+relation{tuple_delimiter}网络不通{tuple_delimiter}获取故障 Pod 信息和事件{tuple_delimiter}REQUIRES_STEP{tuple_delimiter}排查网络不通根因需要获取故障Pod信息和事件
+relation{tuple_delimiter}网络不通{tuple_delimiter}获取Pod对应的数据节点信息{tuple_delimiter}REQUIRES_STEP{tuple_delimiter}排查网络不通根因需要获取Pod对应的数据节点信息
+relation{tuple_delimiter}网络不通{tuple_delimiter}在数据节点上获取磁阵的ip地址{tuple_delimiter}REQUIRES_STEP{tuple_delimiter}排查网络不通根因需要获取磁阵IP地址
+relation{tuple_delimiter}网络不通{tuple_delimiter}检查数据节点上的网络连通性{tuple_delimiter}REQUIRES_STEP{tuple_delimiter}排查网络不通根因需要检查数据节点上的网络连通性
+relation{tuple_delimiter}获取故障 Pod 信息和事件{tuple_delimiter}kubectl get pod{tuple_delimiter}USES_CODE{tuple_delimiter}获取Pod信息需要执行kubectl get pod命令
+relation{tuple_delimiter}获取故障 Pod 信息和事件{tuple_delimiter}kubectl get events{tuple_delimiter}USES_CODE{tuple_delimiter}获取相关事件需要执行kubectl get events命令
+relation{tuple_delimiter}获取故障 Pod 信息和事件{tuple_delimiter}获取Pod对应的数据节点信息{tuple_delimiter}NEXT_STEP{tuple_delimiter}获取Pod信息后下一步是获取数据节点信息
+relation{tuple_delimiter}获取Pod对应的数据节点信息{tuple_delimiter}在数据节点上获取磁阵的ip地址{tuple_delimiter}NEXT_STEP{tuple_delimiter}获取节点信息后下一步是获取磁阵IP地址
+relation{tuple_delimiter}在数据节点上获取磁阵的ip地址{tuple_delimiter}iscsiadm session{tuple_delimiter}USES_CODE{tuple_delimiter}获取磁阵session需要执行iscsiadm -m session命令
+relation{tuple_delimiter}在数据节点上获取磁阵的ip地址{tuple_delimiter}检查数据节点上的网络连通性{tuple_delimiter}NEXT_STEP{tuple_delimiter}获取磁阵IP后下一步是检查网络连通性
+relation{tuple_delimiter}检查数据节点上的网络连通性{tuple_delimiter}ping storage ip{tuple_delimiter}USES_CODE{tuple_delimiter}检查网络连通性需要执行ping命令测试
+relation{tuple_delimiter}检查数据节点上的网络连通性{tuple_delimiter}网络不通导致卷挂载失败{tuple_delimiter}LEADS_TO{tuple_delimiter}检查网络连通性后得出网络不通导致卷挂载失败的结论
 {completion_delimiter}
-
-""",
-    """<Entity_types>
-["Person","Creature","Organization","Location","Event","Concept","Method","Content","Data","Artifact","NaturalObject"]
-
-<Input Text>
-```
-Stock markets faced a sharp downturn today as tech giants saw significant declines, with the global tech index dropping by 3.4% in midday trading. Analysts attribute the selloff to investor concerns over rising interest rates and regulatory uncertainty.
-
-Among the hardest hit, nexon technologies saw its stock plummet by 7.8% after reporting lower-than-expected quarterly earnings. In contrast, Omega Energy posted a modest 2.1% gain, driven by rising oil prices.
-
-Meanwhile, commodity markets reflected a mixed sentiment. Gold futures rose by 1.5%, reaching $2,080 per ounce, as investors sought safe-haven assets. Crude oil prices continued their rally, climbing to $87.60 per barrel, supported by supply constraints and strong demand.
-
-Financial experts are closely watching the Federal Reserve's next move, as speculation grows over potential rate hikes. The upcoming policy announcement is expected to influence investor confidence and overall market stability.
-```
-
-<Output>
-entity{tuple_delimiter}Global Tech Index{tuple_delimiter}category{tuple_delimiter}The Global Tech Index tracks the performance of major technology stocks and experienced a 3.4% decline today.
-entity{tuple_delimiter}Nexon Technologies{tuple_delimiter}organization{tuple_delimiter}Nexon Technologies is a tech company that saw its stock decline by 7.8% after disappointing earnings.
-entity{tuple_delimiter}Omega Energy{tuple_delimiter}organization{tuple_delimiter}Omega Energy is an energy company that gained 2.1% in stock value due to rising oil prices.
-entity{tuple_delimiter}Gold Futures{tuple_delimiter}product{tuple_delimiter}Gold futures rose by 1.5%, indicating increased investor interest in safe-haven assets.
-entity{tuple_delimiter}Crude Oil{tuple_delimiter}product{tuple_delimiter}Crude oil prices rose to $87.60 per barrel due to supply constraints and strong demand.
-entity{tuple_delimiter}Market Selloff{tuple_delimiter}category{tuple_delimiter}Market selloff refers to the significant decline in stock values due to investor concerns over interest rates and regulations.
-entity{tuple_delimiter}Federal Reserve Policy Announcement{tuple_delimiter}category{tuple_delimiter}The Federal Reserve's upcoming policy announcement is expected to impact investor confidence and market stability.
-entity{tuple_delimiter}3.4% Decline{tuple_delimiter}category{tuple_delimiter}The Global Tech Index experienced a 3.4% decline in midday trading.
-relation{tuple_delimiter}Global Tech Index{tuple_delimiter}Market Selloff{tuple_delimiter}market performance, investor sentiment{tuple_delimiter}The decline in the Global Tech Index is part of the broader market selloff driven by investor concerns.
-relation{tuple_delimiter}Nexon Technologies{tuple_delimiter}Global Tech Index{tuple_delimiter}company impact, index movement{tuple_delimiter}Nexon Technologies' stock decline contributed to the overall drop in the Global Tech Index.
-relation{tuple_delimiter}Gold Futures{tuple_delimiter}Market Selloff{tuple_delimiter}market reaction, safe-haven investment{tuple_delimiter}Gold prices rose as investors sought safe-haven assets during the market selloff.
-relation{tuple_delimiter}Federal Reserve Policy Announcement{tuple_delimiter}Market Selloff{tuple_delimiter}interest rate impact, financial regulation{tuple_delimiter}Speculation over Federal Reserve policy changes contributed to market volatility and investor selloff.
-{completion_delimiter}
-
-""",
-    """<Entity_types>
-["Person","Creature","Organization","Location","Event","Concept","Method","Content","Data","Artifact","NaturalObject"]
-
-<Input Text>
-```
-At the World Athletics Championship in Tokyo, Noah Carter broke the 100m sprint record using cutting-edge carbon-fiber spikes.
-```
-
-<Output>
-entity{tuple_delimiter}World Athletics Championship{tuple_delimiter}event{tuple_delimiter}The World Athletics Championship is a global sports competition featuring top athletes in track and field.
-entity{tuple_delimiter}Tokyo{tuple_delimiter}location{tuple_delimiter}Tokyo is the host city of the World Athletics Championship.
-entity{tuple_delimiter}Noah Carter{tuple_delimiter}person{tuple_delimiter}Noah Carter is a sprinter who set a new record in the 100m sprint at the World Athletics Championship.
-entity{tuple_delimiter}100m Sprint Record{tuple_delimiter}category{tuple_delimiter}The 100m sprint record is a benchmark in athletics, recently broken by Noah Carter.
-entity{tuple_delimiter}Carbon-Fiber Spikes{tuple_delimiter}equipment{tuple_delimiter}Carbon-fiber spikes are advanced sprinting shoes that provide enhanced speed and traction.
-entity{tuple_delimiter}World Athletics Federation{tuple_delimiter}organization{tuple_delimiter}The World Athletics Federation is the governing body overseeing the World Athletics Championship and record validations.
-relation{tuple_delimiter}World Athletics Championship{tuple_delimiter}Tokyo{tuple_delimiter}event location, international competition{tuple_delimiter}The World Athletics Championship is being hosted in Tokyo.
-relation{tuple_delimiter}Noah Carter{tuple_delimiter}100m Sprint Record{tuple_delimiter}athlete achievement, record-breaking{tuple_delimiter}Noah Carter set a new 100m sprint record at the championship.
-relation{tuple_delimiter}Noah Carter{tuple_delimiter}Carbon-Fiber Spikes{tuple_delimiter}athletic equipment, performance boost{tuple_delimiter}Noah Carter used carbon-fiber spikes to enhance performance during the race.
-relation{tuple_delimiter}Noah Carter{tuple_delimiter}World Athletics Championship{tuple_delimiter}athlete participation, competition{tuple_delimiter}Noah Carter is competing at the World Athletics Championship.
-{completion_delimiter}
-
 """,
 ]
 
