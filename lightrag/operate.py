@@ -1127,6 +1127,7 @@ async def _rebuild_single_entity(
     ):
         try:
             # Update entity in graph storage (critical path)
+            now = int(time.time())
             updated_entity_data = {
                 **current_entity,
                 "description": final_description,
@@ -1135,7 +1136,8 @@ async def _rebuild_single_entity(
                 "file_path": GRAPH_FIELD_SEP.join(file_paths)
                 if file_paths
                 else current_entity.get("file_path", "unknown_source"),
-                "created_at": int(time.time()),
+                "created_at": current_entity.get("created_at", now),
+                "updated_at": now,
                 "truncate": truncation_info,
             }
             await knowledge_graph_inst.upsert_node(entity_name, updated_entity_data)
@@ -1483,6 +1485,7 @@ async def _rebuild_single_relationship(
         truncation_info = ""
 
     # Update relationship in graph storage
+    now = int(time.time())
     updated_relationship_data = {
         **current_relationship,
         "description": final_description
@@ -1494,6 +1497,8 @@ async def _rebuild_single_relationship(
         "file_path": GRAPH_FIELD_SEP.join([fp for fp in file_paths_list if fp])
         if file_paths_list
         else current_relationship.get("file_path", "unknown_source"),
+        "created_at": current_relationship.get("created_at", now),
+        "updated_at": now,
         "truncate": truncation_info,
     }
 
@@ -1509,14 +1514,15 @@ async def _rebuild_single_relationship(
 
     for node_id in {src, tgt}:
         if not (await knowledge_graph_inst.has_node(node_id)):
-            node_created_at = int(time.time())
+            node_now = int(time.time())
             node_data = {
                 "entity_id": node_id,
                 "source_id": node_source_id,
                 "description": node_description,
                 "entity_type": "UNKNOWN",
                 "file_path": node_file_path,
-                "created_at": node_created_at,
+                "created_at": node_now,
+                "updated_at": node_now,
                 "truncate": "",
             }
             await knowledge_graph_inst.upsert_node(node_id, node_data=node_data)
@@ -1903,13 +1909,15 @@ async def _merge_nodes_then_upsert(
             logger.debug(status_message)
 
         # 11. Update both graph and vector db
+        now = int(time.time())
         node_data = dict(
             entity_id=entity_name,
             entity_type=entity_type,
             description=description,
             source_id=source_id,
             file_path=file_path,
-            created_at=int(time.time()),
+            created_at=already_node.get("created_at", now) if already_node else now,
+            updated_at=now,
             truncate=truncation_info,
         )
         await knowledge_graph_inst.upsert_node(
@@ -2258,14 +2266,15 @@ async def _merge_edges_then_upsert(
 
             if existing_node is None:
                 # Node doesn't exist - create new node
-                node_created_at = int(time.time())
+                node_now = int(time.time())
                 node_data = {
                     "entity_id": need_insert_id,
                     "source_id": source_id,
                     "description": description,
                     "entity_type": "UNKNOWN",
                     "file_path": file_path,
-                    "created_at": node_created_at,
+                    "created_at": node_now,
+                    "updated_at": node_now,
                     "truncate": "",
                 }
                 await knowledge_graph_inst.upsert_node(
@@ -2313,7 +2322,8 @@ async def _merge_edges_then_upsert(
                         "description": description,
                         "source_id": source_id,
                         "file_path": file_path,
-                        "created_at": node_created_at,
+                        "created_at": node_now,
+                        "updated_at": node_now,
                     }
                     added_entities.append(entity_data)
             else:
@@ -2383,6 +2393,8 @@ async def _merge_edges_then_upsert(
                     updated_node_data = {
                         **existing_node,
                         "source_id": limited_source_id_str,
+                        "created_at": existing_node.get("created_at", int(time.time())),
+                        "updated_at": int(time.time()),
                     }
                     await knowledge_graph_inst.upsert_node(
                         need_insert_id, node_data=updated_node_data
@@ -2428,7 +2440,9 @@ async def _merge_edges_then_upsert(
                             pipeline_status["latest_message"] = status_message
                             pipeline_status["history_messages"].append(status_message)
 
-        edge_created_at = int(time.time())
+        edge_now = int(time.time())
+        # Preserve original created_at if edge already exists
+        edge_created_at = already_edge.get("created_at", edge_now) if already_edge else edge_now
         await knowledge_graph_inst.upsert_edge(
             src_id,
             tgt_id,
@@ -2439,6 +2453,7 @@ async def _merge_edges_then_upsert(
                 source_id=source_id,
                 file_path=file_path,
                 created_at=edge_created_at,
+                updated_at=edge_now,
                 truncate=truncation_info,
             ),
         )
@@ -2451,6 +2466,7 @@ async def _merge_edges_then_upsert(
             source_id=source_id,
             file_path=file_path,
             created_at=edge_created_at,
+            updated_at=edge_now,
             truncate=truncation_info,
             weight=weight,
         )
@@ -2569,7 +2585,7 @@ async def merge_nodes_and_edges(
     rename_map = {}  # old_name -> existing_name
     # 整理所有的nodes和edges
     # Entity types allowed for merging (lowercase, no spaces as stored)
-    _mergeable_entity_types = {"checkstep", "codeaction", "faultsymptom"}
+    _mergeable_entity_types = {"checkstep", "codeaction", "faultsymptom", "faultcategory"}
 
     for i, (maybe_nodes, maybe_edges) in enumerate(chunk_results, start=1):
         for entity_name, entities in maybe_nodes.items():
@@ -3925,6 +3941,10 @@ async def _apply_token_truncation(
         if isinstance(created_at, (int, float)):
             created_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(created_at))
 
+        updated_at = entity.get("updated_at", "UNKNOWN")
+        if isinstance(updated_at, (int, float)):
+            updated_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(updated_at))
+
         # Store mapping from entity name to original data
         entity_id_to_original[entity_name] = entity
 
@@ -3934,6 +3954,7 @@ async def _apply_token_truncation(
                 "type": entity.get("entity_type", "UNKNOWN"),
                 "description": entity.get("description", "UNKNOWN"),
                 "created_at": created_at,
+                "updated_at": updated_at,
                 "file_path": entity.get("file_path", "unknown_source"),
             }
         )
@@ -3944,6 +3965,10 @@ async def _apply_token_truncation(
         created_at = relation.get("created_at", "UNKNOWN")
         if isinstance(created_at, (int, float)):
             created_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(created_at))
+
+        updated_at = relation.get("updated_at", "UNKNOWN")
+        if isinstance(updated_at, (int, float)):
+            updated_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(updated_at))
 
         # Handle different relation data formats
         if "src_tgt" in relation:
@@ -3961,6 +3986,7 @@ async def _apply_token_truncation(
                 "entity2": entity2,
                 "description": relation.get("description", "UNKNOWN"),
                 "created_at": created_at,
+                "updated_at": updated_at,
                 "file_path": relation.get("file_path", "unknown_source"),
             }
         )
@@ -3971,12 +3997,13 @@ async def _apply_token_truncation(
 
     # Apply token-based truncation
     if entities_context:
-        # Remove file_path and created_at for token calculation
+        # Remove file_path, created_at and updated_at for token calculation
         entities_context_for_truncation = []
         for entity in entities_context:
             entity_copy = entity.copy()
             entity_copy.pop("file_path", None)
             entity_copy.pop("created_at", None)
+            entity_copy.pop("updated_at", None)
             entities_context_for_truncation.append(entity_copy)
 
         entities_context = truncate_list_by_token_size(
@@ -3989,12 +4016,13 @@ async def _apply_token_truncation(
         )
 
     if relations_context:
-        # Remove file_path and created_at for token calculation
+        # Remove file_path, created_at and updated_at for token calculation
         relations_context_for_truncation = []
         for relation in relations_context:
             relation_copy = relation.copy()
             relation_copy.pop("file_path", None)
             relation_copy.pop("created_at", None)
+            relation_copy.pop("updated_at", None)
             relations_context_for_truncation.append(relation_copy)
 
         relations_context = truncate_list_by_token_size(

@@ -1,6 +1,8 @@
 import os
 import asyncio
+import time as _time
 import numpy as np
+from datetime import datetime
 from dotenv import load_dotenv
 from lightrag import LightRAG
 from lightrag.utils import EmbeddingFunc
@@ -84,17 +86,17 @@ async def build_check_flow(rag, user_query: str, top_k_symptoms: int = 3):
     results = []
 
     # ---------- 5.1 & 5.2 语义检索 FaultSymptom ----------
-    raw_results = await rag.entities_vdb.query(user_query, top_k=5)
-    print(f"语义检索原始结果: {raw_results}")
+    raw_results = await rag.entities_vdb.query(user_query, top_k=15)
+    # print(f"语义检索原始结果: {raw_results}")
 
     symptoms = []
     for r in raw_results:
         entity_name = r.get("entity_name") or r.get("id")
         node = await graph.get_node(entity_name)
-        print(f"检索结果实体: {entity_name}\n 节点数据: {node}")
+        # print(f"检索结果实体: {entity_name}\n 节点数据: {node}")
         if node and node.get("entity_type") == "faultsymptom":
             symptoms.append((r.get("distance"), node))
-    print(f"语义检索到的 FaultSymptom 数量: {len(symptoms)}")
+    print(f"语义检索到的 FaultSymptom : {symptoms}")
 
     # ---------- 5.3 遍历 FaultCategory 并收集 RootCause（按 Category 分组） ----------
     symptoms_with_categories = []
@@ -105,6 +107,7 @@ async def build_check_flow(rag, user_query: str, top_k_symptoms: int = 3):
             or symptom.get("entity_name")
         )
         edges = await graph.get_node_edges(symptom_id) or []
+        print(f"edges: {edges}")
         faultcategories = []
 
         for src_id, tgt_id in edges:
@@ -114,6 +117,10 @@ async def build_check_flow(rag, user_query: str, top_k_symptoms: int = 3):
 
             if neighbor and neighbor.get("entity_type") == "faultcategory":
                 edge_data = await graph.get_edge(symptom_id, neighbor_id) or {}
+
+                # 读取 faultcategory 节点的时间信息
+                category_updated_at = neighbor.get("updated_at", 0) or 0
+                category_created_at = neighbor.get("created_at", 0) or 0
 
                 # 遍历该 Category 的边，找 RootCause
                 cat_edges = await graph.get_node_edges(neighbor_id) or []
@@ -132,12 +139,15 @@ async def build_check_flow(rag, user_query: str, top_k_symptoms: int = 3):
                             or root_node.get("last_time")
                             or root_node.get("timestamp", "")
                         )
+                        # 也读取 rootcause 节点的 updated_at
+                        rootcause_updated_at = root_node.get("updated_at", 0) or 0
                         rootcauses.append({
                             "rootcause_id": root_id,
                             "rootcause_name": root_node.get("entity_name", root_id),
                             "description": root_node.get("description", ""),
                             "visit_count": int(visit_count) if visit_count else 0,
                             "last_time": str(last_time) if last_time else "",
+                            "updated_at": rootcause_updated_at,
                         })
 
                 faultcategories.append({
@@ -147,6 +157,8 @@ async def build_check_flow(rag, user_query: str, top_k_symptoms: int = 3):
                     "relation_weight": edge_data.get("weight", 0),
                     "relation_keywords": edge_data.get("keywords", ""),
                     "source_chunk": neighbor.get("source_id", ""),
+                    "updated_at": category_updated_at,
+                    "created_at": category_created_at,
                     "rootcauses": rootcauses,
                 })
 
@@ -157,8 +169,7 @@ async def build_check_flow(rag, user_query: str, top_k_symptoms: int = 3):
         })
     print(f"symptoms_with_categories: {symptoms_with_categories}")
 
-    # ---------- 5.4 按 FaultCategory 聚合排序 ----------
-    from datetime import datetime
+    # ---------- 5.4 按 FaultCategory 聚合排序（含时间衰减） ----------
 
     def parse_time(time_str):
         if not time_str or time_str in ("None", "null", ""):
@@ -170,6 +181,18 @@ async def build_check_flow(rag, user_query: str, top_k_symptoms: int = 3):
                 return datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S").timestamp()
         except Exception:
             return 0
+
+    # 时间衰减函数：half_life_days 为半衰期天数，updated_at 为 unix timestamp
+    # 返回 0~1 的衰减因子，越新越接近 1
+    TIME_DECAY_HALF_LIFE_DAYS = 30  # 半衰期 30 天，可根据业务调整
+
+    def time_decay_score(updated_at: int, half_life_days: float = TIME_DECAY_HALF_LIFE_DAYS) -> float:
+        if not updated_at or updated_at <= 0:
+            return 0.0
+        age_seconds = _time.time() - updated_at
+        if age_seconds < 0:
+            return 1.0
+        return 0.5 ** (age_seconds / (half_life_days * 86400))
 
     category_candidates = []
     for item in symptoms_with_categories:
@@ -183,9 +206,27 @@ async def build_check_flow(rag, user_query: str, top_k_symptoms: int = 3):
         for cat in item["faultcategories"]:
             rootcauses = cat.get("rootcauses", [])
             total_visits = sum(rc["visit_count"] for rc in rootcauses)
-            latest_time_ts = max(
-                (parse_time(rc["last_time"]) for rc in rootcauses),
-                default=0
+
+            # 综合 FaultCategory 节点和其下 RootCause 节点的 updated_at，
+            # 取最新一个作为该候选类别的最新更新时间
+            all_updated_ats = [cat.get("updated_at", 0) or 0]
+            all_updated_ats.extend(rc.get("updated_at", 0) or 0 for rc in rootcauses)
+            latest_updated_at = max(all_updated_ats)
+
+            # 综合评分 = 语义相似度权重 + 访问频次权重 + 时间衰减权重
+            # 语义相似度: distance 越大越好，取倒数
+            sim_component = sim_score if sim_score else 0.0
+            # 访问频次: log 平滑，避免大数值主导
+            import math
+            visit_component = math.log1p(total_visits)
+            # 时间衰减: 越新越高
+            time_component = time_decay_score(latest_updated_at)
+
+            # 综合评分（权重可调）
+            composite_score = (
+                0.6 * sim_component
+                + 0.2 * visit_component
+                + 0.2 * time_component
             )
 
             category_candidates.append({
@@ -194,17 +235,19 @@ async def build_check_flow(rag, user_query: str, top_k_symptoms: int = 3):
                 "symptom_id": symptom_id,
                 "similarity_score": sim_score,
                 "total_visits": total_visits,
-                "latest_time_ts": latest_time_ts,
+                "latest_updated_at": latest_updated_at,
+                "time_decay_score": time_component,
+                "composite_score": composite_score,
                 "rootcauses": rootcauses,
             })
 
     if not category_candidates:
         print("未找到任何 FaultCategory，返回空结果")
         return results
-
-    # 先按总访问次数降序，再按最近访问时间降序
+    print(f"categories: {category_candidates}")
+    # 按综合评分降序排序
     category_candidates.sort(
-        key=lambda c: (c["total_visits"], c["latest_time_ts"]),
+        key=lambda c: c["composite_score"],
         reverse=True
     )
     topk_cats = category_candidates[:top_k_symptoms]
@@ -216,7 +259,8 @@ async def build_check_flow(rag, user_query: str, top_k_symptoms: int = 3):
     if len(topk_cats) > 1:
         candidates_text = "\n".join([
             f"{i+1}. {c['category']['category_name']}（描述: {c['category']['description']}，"
-            f"关联根因数: {len(c['rootcauses'])}，总访问: {c['total_visits']}）"
+            f"关联根因数: {len(c['rootcauses'])}，总访问: {c['total_visits']}，"
+            f"综合评分: {c['composite_score']:.3f}，时间衰减: {c['time_decay_score']:.3f}）"
             for i, c in enumerate(topk_cats)
         ])
 
@@ -327,8 +371,8 @@ async def main():
     rag = await init_rag_from_env()
 
     # 用户描述的症状（可以是自然语言，不需要精确匹配节点名）
-    user_input = "Pod 处于 ContainerCreating 状态, Event reason 提示all targetPortals not available"
-    flows = await build_check_flow(rag, user_input, top_k_symptoms=5)
+    user_input = "Pod 处于 ContainerCreating 状态"
+    flows = await build_check_flow(rag, user_input, top_k_symptoms=20)
 
     for flow in flows:
         fs = flow["fault_symptom"]
