@@ -159,6 +159,7 @@ async def build_check_flow(rag, user_query: str, top_k_symptoms: int = 3):
                     "source_chunk": neighbor.get("source_id", ""),
                     "updated_at": category_updated_at,
                     "created_at": category_created_at,
+                    "count": neighbor.get("count", 0) or 0,
                     "rootcauses": rootcauses,
                 })
 
@@ -206,6 +207,7 @@ async def build_check_flow(rag, user_query: str, top_k_symptoms: int = 3):
         for cat in item["faultcategories"]:
             rootcauses = cat.get("rootcauses", [])
             total_visits = sum(rc["visit_count"] for rc in rootcauses)
+            category_count = cat.get("count", 0) or 0
 
             # 综合 FaultCategory 节点和其下 RootCause 节点的 updated_at，
             # 取最新一个作为该候选类别的最新更新时间
@@ -213,20 +215,23 @@ async def build_check_flow(rag, user_query: str, top_k_symptoms: int = 3):
             all_updated_ats.extend(rc.get("updated_at", 0) or 0 for rc in rootcauses)
             latest_updated_at = max(all_updated_ats)
 
-            # 综合评分 = 语义相似度权重 + 访问频次权重 + 时间衰减权重
-            # 语义相似度: distance 越大越好，取倒数
+            # 综合评分 = 语义相似度 + 访问频次 + 时间衰减 + 命中次数
+            # 语义相似度: distance 越大越好
             sim_component = sim_score if sim_score else 0.0
             # 访问频次: log 平滑，避免大数值主导
             import math
             visit_component = math.log1p(total_visits)
             # 时间衰减: 越新越高
             time_component = time_decay_score(latest_updated_at)
+            # 命中次数: log 平滑，表示该 category 被知识图谱 merge 的次数
+            count_component = math.log1p(category_count)
 
             # 综合评分（权重可调）
             composite_score = (
-                0.6 * sim_component
-                + 0.2 * visit_component
-                + 0.2 * time_component
+                0.4 * sim_component
+                + 0.15 * visit_component
+                + 0.15 * time_component
+                + 0.3 * count_component
             )
 
             category_candidates.append({
@@ -235,6 +240,7 @@ async def build_check_flow(rag, user_query: str, top_k_symptoms: int = 3):
                 "symptom_id": symptom_id,
                 "similarity_score": sim_score,
                 "total_visits": total_visits,
+                "category_count": category_count,
                 "latest_updated_at": latest_updated_at,
                 "time_decay_score": time_component,
                 "composite_score": composite_score,
@@ -260,6 +266,7 @@ async def build_check_flow(rag, user_query: str, top_k_symptoms: int = 3):
         candidates_text = "\n".join([
             f"{i+1}. {c['category']['category_name']}（描述: {c['category']['description']}，"
             f"关联根因数: {len(c['rootcauses'])}，总访问: {c['total_visits']}，"
+            f"命中次数: {c['category_count']}，"
             f"综合评分: {c['composite_score']:.3f}，时间衰减: {c['time_decay_score']:.3f}）"
             for i, c in enumerate(topk_cats)
         ])

@@ -1138,6 +1138,7 @@ async def _rebuild_single_entity(
                 else current_entity.get("file_path", "unknown_source"),
                 "created_at": current_entity.get("created_at", now),
                 "updated_at": now,
+                "count": current_entity.get("count", 0) or 0,
                 "truncate": truncation_info,
             }
             await knowledge_graph_inst.upsert_node(entity_name, updated_entity_data)
@@ -1523,6 +1524,7 @@ async def _rebuild_single_relationship(
                 "file_path": node_file_path,
                 "created_at": node_now,
                 "updated_at": node_now,
+                "count": 1,
                 "truncate": "",
             }
             await knowledge_graph_inst.upsert_node(node_id, node_data=node_data)
@@ -1918,6 +1920,7 @@ async def _merge_nodes_then_upsert(
             file_path=file_path,
             created_at=already_node.get("created_at", now) if already_node else now,
             updated_at=now,
+            count=(already_node.get("count", 0) or 0) + 1 if already_node else 1,
             truncate=truncation_info,
         )
         await knowledge_graph_inst.upsert_node(
@@ -2275,6 +2278,7 @@ async def _merge_edges_then_upsert(
                     "file_path": file_path,
                     "created_at": node_now,
                     "updated_at": node_now,
+                    "count": 1,
                     "truncate": "",
                 }
                 await knowledge_graph_inst.upsert_node(
@@ -2324,6 +2328,7 @@ async def _merge_edges_then_upsert(
                         "file_path": file_path,
                         "created_at": node_now,
                         "updated_at": node_now,
+                        "count": 1,
                     }
                     added_entities.append(entity_data)
             else:
@@ -2395,6 +2400,7 @@ async def _merge_edges_then_upsert(
                         "source_id": limited_source_id_str,
                         "created_at": existing_node.get("created_at", int(time.time())),
                         "updated_at": int(time.time()),
+                        "count": existing_node.get("count", 0) or 0,
                     }
                     await knowledge_graph_inst.upsert_node(
                         need_insert_id, node_data=updated_node_data
